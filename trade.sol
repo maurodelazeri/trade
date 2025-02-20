@@ -86,48 +86,47 @@ contract MorphoTrader {
     }
 
 
-    function checkPosition(bytes32 marketId, address borrower) public view returns (bool isLiquidatable, uint256 suggestedAmount) {
-        IMorpho.MarketParams memory marketParams = IMorpho(MORPHO).idToMarketParams(marketId);
-        IMorpho.Position memory pos = IMorpho(MORPHO).position(marketId, borrower);
+function checkPosition(bytes32 marketId, address borrower) public view returns (bool isLiquidatable, uint256 suggestedAmount) {
+    IMorpho.MarketParams memory marketParams = IMorpho(MORPHO).idToMarketParams(marketId);
+    IMorpho.Position memory pos = IMorpho(MORPHO).position(marketId, borrower);
 
-        (,, uint256 totalBorrowAssets, uint256 totalBorrowShares,,) = IMorpho(MORPHO).market(marketId);
+    (,, uint256 totalBorrowAssets, uint256 totalBorrowShares,,) = IMorpho(MORPHO).market(marketId);
 
-        uint256 borrowed = totalBorrowShares > 0 ?
-            (uint256(pos.borrowShares) * totalBorrowAssets) / totalBorrowShares : 0;
-        uint256 collateral = uint256(pos.collateral);
+    uint256 borrowed = totalBorrowShares > 0 ?
+        (uint256(pos.borrowShares) * totalBorrowAssets) / totalBorrowShares : 0;
+    uint256 collateral = uint256(pos.collateral);
 
-        console.log("Borrow Shares:", pos.borrowShares);
-        console.log("Collateral (raw):", collateral);
-        console.log("Borrowed (raw):", borrowed);
-        console.log("Borrowed in DAI:", borrowed / 1e18);
+    console.log("Borrow Shares:", pos.borrowShares);
+    console.log("Collateral (raw):", collateral);
+    console.log("Borrowed (raw):", borrowed);
+    console.log("Borrowed in DAI:", borrowed / 1e18);
 
-        if (borrowed == 0 || collateral == 0) {
-            console.log("No active position for borrower");
-            return (false, 0);
-        }
-
-        uint256 collateralPrice = IOracle(marketParams.oracle).price();
-        console.log("Oracle Price (raw):", collateralPrice);
-        console.log("Oracle Price in DAI:", collateralPrice / 1e18);
-
-        // Calculate in steps for visibility
-        uint256 step1 = collateral * collateralPrice;
-        console.log("Step 1 (collateral * price):", step1);
-
-        uint256 collateralValue = step1 / 1e18;
-        console.log("Collateral Value in DAI:", collateralValue / 1e18);
-
-        // Calculate LTV: (borrowed / collateralValue) * 100
-        uint256 ltv = (borrowed * 1e18) / collateralValue;
-
-        console.log("LTV (raw):", ltv);
-        console.log("LTV as percentage:", ltv * 100 / 1e18);
-
-        isLiquidatable = ltv > 0.85e18; // 85% threshold
-        if (isLiquidatable) {
-            suggestedAmount = (borrowed * 1927) / 10000; // 19.27%
-        }
+    if (borrowed == 0 || collateral == 0) {
+        console.log("No position found");
+        return (false, 0);
     }
+
+    uint256 collateralPrice = IOracle(marketParams.oracle).price();
+    console.log("Oracle Price (raw):", collateralPrice);
+
+    // Calculate collateral value with proper scaling
+    uint256 collateralValue = (collateral * collateralPrice) / 1e18;
+    console.log("Collateral Value in DAI:", collateralValue / 1e18);
+
+    // Calculate LTV with scaling: (borrowed * WAD) / collateralValue
+    uint256 ltv = (borrowed * 1e18) / (collateralValue);
+    uint256 liqThreshold = 85 * 1e16; // 85% in WAD
+
+    console.log("LTV (raw):", ltv);
+    console.log("LTV %:", (ltv * 100) / 1e18);
+
+    // Check liquidation threshold
+    isLiquidatable = ltv > liqThreshold;
+    if (isLiquidatable) {
+        suggestedAmount = (borrowed * 1927) / 10000; // 19.27%
+        console.log("Suggested Liquidation Amount:", suggestedAmount / 1e18);
+    }
+}
 
     function executePreliquidation(bytes32 marketId, address targetBorrower) external {
         require(msg.sender == owner, "Not owner");
