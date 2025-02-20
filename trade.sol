@@ -4,7 +4,7 @@ pragma solidity 0.8.10;
 import "forge-std/Script.sol";
 import "forge-std/console.sol";
 import {IOracle} from "../lib/morpho-blue/src/interfaces/IOracle.sol";
-import {MathLib} from "../lib/morpho-blue/src/libraries/MathLib.sol";
+import {MathLib, WAD} from "../lib/morpho-blue/src/libraries/MathLib.sol";
 
 interface IMorpho {
     struct MarketParams {
@@ -73,17 +73,33 @@ contract MorphoTrader {
         owner = msg.sender;
     }
 
+    function wMulDown(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivDown(x, y, WAD); // WAD = 1e18
+    }
+
+    function wDivDown(uint256 x, uint256 y) internal pure returns (uint256) {
+        return mulDivDown(x, WAD, y);
+    }
+
+    function mulDivDown(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
+        return (x * y) / d;
+    }
+
+
     function checkPosition(bytes32 marketId, address borrower) public view returns (bool isLiquidatable, uint256 suggestedAmount) {
         IMorpho.MarketParams memory marketParams = IMorpho(MORPHO).idToMarketParams(marketId);
         IMorpho.Position memory pos = IMorpho(MORPHO).position(marketId, borrower);
 
         (,, uint256 totalBorrowAssets, uint256 totalBorrowShares,,) = IMorpho(MORPHO).market(marketId);
-        uint256 borrowed = totalBorrowShares > 0 ? (uint256(pos.borrowShares) * totalBorrowAssets) / totalBorrowShares : 0;
+
+        uint256 borrowed = totalBorrowShares > 0 ?
+            (uint256(pos.borrowShares) * totalBorrowAssets) / totalBorrowShares : 0;
         uint256 collateral = uint256(pos.collateral);
 
         console.log("Borrow Shares:", pos.borrowShares);
-        console.log("Collateral:", collateral);
-        console.log("Borrowed Assets (estimated):", borrowed);
+        console.log("Collateral (raw):", collateral);
+        console.log("Borrowed (raw):", borrowed);
+        console.log("Borrowed in DAI:", borrowed / 1e18);
 
         if (borrowed == 0 || collateral == 0) {
             console.log("No active position for borrower");
@@ -91,17 +107,26 @@ contract MorphoTrader {
         }
 
         uint256 collateralPrice = IOracle(marketParams.oracle).price();
-        uint256 collateralValue = (collateral * collateralPrice) / 1e18;
-        uint256 ltv = borrowed.wMulDown(1e18).wDivDown(collateralValue);
+        console.log("Oracle Price (raw):", collateralPrice);
+        console.log("Oracle Price in DAI:", collateralPrice / 1e18);
 
-        isLiquidatable = ltv > 0.85e18;
+        // Calculate in steps for visibility
+        uint256 step1 = collateral * collateralPrice;
+        console.log("Step 1 (collateral * price):", step1);
+
+        uint256 collateralValue = step1 / 1e18;
+        console.log("Collateral Value in DAI:", collateralValue / 1e18);
+
+        // Calculate LTV: (borrowed / collateralValue) * 100
+        uint256 ltv = (borrowed * 1e18) / collateralValue;
+
+        console.log("LTV (raw):", ltv);
+        console.log("LTV as percentage:", ltv * 100 / 1e18);
+
+        isLiquidatable = ltv > 0.85e18; // 85% threshold
         if (isLiquidatable) {
             suggestedAmount = (borrowed * 1927) / 10000; // 19.27%
         }
-
-        console.log("Price:", collateralPrice);
-        console.log("Collateral Value:", collateralValue);
-        console.log("LTV:", ltv);
     }
 
     function executePreliquidation(bytes32 marketId, address targetBorrower) external {
@@ -171,9 +196,9 @@ contract DeployTrader is Script {
         console.log("IRM:", params.irm);
         console.log("LLTV:", params.lltv);
 
-        (,, uint256 totalBorrowAssets, uint256 totalBorrowShares, uint256 lastUpdate,) = IMorpho(MORPHO).market(MARKET_ID);
+        (uint256 totalSupplyAssets,, uint256 totalBorrowAssets, uint256 totalBorrowShares, uint256 lastUpdate,) = IMorpho(MORPHO).market(MARKET_ID);
         console.log("\nMarket State Raw Values:");
-        console.log("Total Supply:", totalBorrowAssets); // Fix this to totalSupplyAssets if intended
+        console.log("Total Supply:", totalSupplyAssets);
         console.log("Total Borrow:", totalBorrowAssets);
         console.log("Last Update:", lastUpdate);
 
