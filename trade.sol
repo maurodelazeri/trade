@@ -5,6 +5,8 @@ import "forge-std/Script.sol";
 import "forge-std/console.sol";
 import {IOracle} from "../lib/morpho-blue/src/interfaces/IOracle.sol";
 import {MathLib, WAD} from "../lib/morpho-blue/src/libraries/MathLib.sol";
+import {SharesMathLib} from "../lib/morpho-blue/src/libraries/SharesMathLib.sol";
+import {ORACLE_PRICE_SCALE} from "../lib/morpho-blue/src/libraries/ConstantsLib.sol";
 
 interface IMorpho {
     struct MarketParams {
@@ -34,8 +36,18 @@ interface IMorpho {
     function liquidate(MarketParams memory marketParams, address borrower, uint256 seizedAssets, uint256 repaidShares, bytes memory data) external returns (uint256, uint256);
 }
 
+struct PreLiquidationParams {
+    uint256 preLltv;
+    uint256 preLCF1;
+    uint256 preLCF2;
+    uint256 preLIF1;
+    uint256 preLIF2;
+    address preLiquidationOracle;
+}
+
 interface IPreLiquidation {
     function preLiquidate(address borrower, uint256 seizedAssets, uint256 repaidShares, bytes calldata data) external returns (uint256, uint256);
+    function preLiquidationParams() external view returns (PreLiquidationParams memory);
 }
 
 interface IPool {
@@ -50,6 +62,7 @@ interface IERC20 {
 
 contract MorphoTrader {
     using MathLib for uint256;
+    using SharesMathLib for uint256;
 
     address constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
     address constant MORPHO = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
@@ -73,60 +86,101 @@ contract MorphoTrader {
         owner = msg.sender;
     }
 
-    function wMulDown(uint256 x, uint256 y) internal pure returns (uint256) {
-        return mulDivDown(x, y, WAD); // WAD = 1e18
+    function simulateProfitability(bytes32 marketId, address borrower) public view returns (
+        uint256 repayAmount,
+        uint256 seizedAmount,
+        uint256 flashLoanFee,
+        uint256 netProfit
+    ) {
+        IMorpho.MarketParams memory marketParams = IMorpho(MORPHO).idToMarketParams(marketId);
+        IMorpho.Position memory pos = IMorpho(MORPHO).position(marketId, borrower);
+        (,, uint256 totalBorrowAssets, uint256 totalBorrowShares,,) = IMorpho(MORPHO).market(marketId);
+
+        uint256 borrowed = uint256(pos.borrowShares).toAssetsUp(totalBorrowAssets, totalBorrowShares);
+        uint256 collateral = uint256(pos.collateral);
+
+        if (borrowed == 0 || collateral == 0) {
+            console.log("No position found for profitability simulation");
+            return (0, 0, 0, 0);
+        }
+
+        uint256 collateralPrice = IOracle(marketParams.oracle).price();
+        uint256 collateralValue = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE);
+        uint256 ltv = borrowed.wDivUp(collateralValue);
+
+        uint256 liqThreshold = 85 * 1e16; // 85% in WAD
+        if (ltv <= liqThreshold) {
+            console.log("Position not liquidatable, LTV:", ltv / 1e16);
+            return (0, 0, 0, 0);
+        }
+
+        // Fetch pre-liquidation parameters
+        uint256 preLltv = 70 * 1e16; // Default: 70%
+        uint256 preLIF1 = 105 * 1e16; // Default: 105%
+        uint256 preLIF2 = 10825 * 1e14; // Default: 108.25%
+        if (PRELIQUIDATION != address(0)) {
+            PreLiquidationParams memory params = IPreLiquidation(PRELIQUIDATION).preLiquidationParams();
+            preLltv = params.preLltv;
+            preLIF1 = params.preLIF1;
+            preLIF2 = params.preLIF2;
+        }
+
+        uint256 lltv = marketParams.lltv;
+        uint256 quotient = (ltv - preLltv).wDivDown(lltv - preLltv);
+        uint256 preLIF = quotient.wMulDown(preLIF2 - preLIF1) + preLIF1;
+
+        repayAmount = (borrowed * 1927) / 10000;
+        seizedAmount = repayAmount.wMulDown(preLIF);
+        flashLoanFee = (repayAmount * 9) / 10000;
+        netProfit = seizedAmount > (repayAmount + flashLoanFee) ? seizedAmount - repayAmount - flashLoanFee : 0;
+
+        console.log("Simulated Repay Amount (DAI):", repayAmount / 1e18);
+        console.log("Simulated Seized Amount (DAI):", seizedAmount / 1e18);
+        console.log("Flash Loan Fee (DAI):", flashLoanFee / 1e18);
+        console.log("Net Profit (DAI):", netProfit / 1e18);
+
+        return (repayAmount, seizedAmount, flashLoanFee, netProfit);
     }
 
-    function wDivDown(uint256 x, uint256 y) internal pure returns (uint256) {
-        return mulDivDown(x, WAD, y);
+    function checkPosition(bytes32 marketId, address borrower) public view returns (bool isLiquidatable, uint256 suggestedAmount) {
+        IMorpho.MarketParams memory marketParams = IMorpho(MORPHO).idToMarketParams(marketId);
+        IMorpho.Position memory pos = IMorpho(MORPHO).position(marketId, borrower);
+
+        (,, uint256 totalBorrowAssets, uint256 totalBorrowShares,,) = IMorpho(MORPHO).market(marketId);
+        uint256 borrowed = uint256(pos.borrowShares).toAssetsUp(totalBorrowAssets, totalBorrowShares);
+        uint256 collateral = uint256(pos.collateral);
+
+        console.log("Borrow Shares:", pos.borrowShares);
+        console.log("Collateral (raw):", collateral);
+        console.log("Borrowed (raw):", borrowed);
+        console.log("Borrowed in DAI:", borrowed / 1e18);
+
+        if (borrowed == 0 || collateral == 0) {
+            console.log("No position found");
+            return (false, 0);
+        }
+
+        uint256 collateralPrice = IOracle(marketParams.oracle).price();
+        console.log("Oracle Price (raw):", collateralPrice);
+
+        uint256 collateralValue = collateral.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE);
+        console.log("Collateral Value (raw):", collateralValue);
+        console.log("Collateral Value in DAI:", collateralValue / 1e18);
+
+        uint256 ltv = borrowed.wDivUp(collateralValue);
+        uint256 liqThreshold = 85 * 1e16; // 85% in WAD
+
+        console.log("LTV (raw):", ltv);
+        console.log("LTV %:", ltv / 1e16);
+
+        isLiquidatable = ltv > liqThreshold;
+        if (isLiquidatable) {
+            suggestedAmount = (borrowed * 1927) / 10000;
+            console.log("Suggested Liquidation Amount:", suggestedAmount / 1e18);
+        }
+
+        return (isLiquidatable, suggestedAmount);
     }
-
-    function mulDivDown(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
-        return (x * y) / d;
-    }
-
-
-function checkPosition(bytes32 marketId, address borrower) public view returns (bool isLiquidatable, uint256 suggestedAmount) {
-    IMorpho.MarketParams memory marketParams = IMorpho(MORPHO).idToMarketParams(marketId);
-    IMorpho.Position memory pos = IMorpho(MORPHO).position(marketId, borrower);
-
-    (,, uint256 totalBorrowAssets, uint256 totalBorrowShares,,) = IMorpho(MORPHO).market(marketId);
-
-    uint256 borrowed = totalBorrowShares > 0 ?
-        (uint256(pos.borrowShares) * totalBorrowAssets) / totalBorrowShares : 0;
-    uint256 collateral = uint256(pos.collateral);
-
-    console.log("Borrow Shares:", pos.borrowShares);
-    console.log("Collateral (raw):", collateral);
-    console.log("Borrowed (raw):", borrowed);
-    console.log("Borrowed in DAI:", borrowed / 1e18);
-
-    if (borrowed == 0 || collateral == 0) {
-        console.log("No position found");
-        return (false, 0);
-    }
-
-    uint256 collateralPrice = IOracle(marketParams.oracle).price();
-    console.log("Oracle Price (raw):", collateralPrice);
-
-    // Calculate collateral value with proper scaling
-    uint256 collateralValue = (collateral * collateralPrice) / 1e18;
-    console.log("Collateral Value in DAI:", collateralValue / 1e18);
-
-    // Calculate LTV with scaling: (borrowed * WAD) / collateralValue
-    uint256 ltv = (borrowed * 1e18) / (collateralValue);
-    uint256 liqThreshold = 85 * 1e16; // 85% in WAD
-
-    console.log("LTV (raw):", ltv);
-    console.log("LTV %:", (ltv * 100) / 1e18);
-
-    // Check liquidation threshold
-    isLiquidatable = ltv > liqThreshold;
-    if (isLiquidatable) {
-        suggestedAmount = (borrowed * 1927) / 10000; // 19.27%
-        console.log("Suggested Liquidation Amount:", suggestedAmount / 1e18);
-    }
-}
 
     function executePreliquidation(bytes32 marketId, address targetBorrower) external {
         require(msg.sender == owner, "Not owner");
@@ -180,6 +234,8 @@ function checkPosition(bytes32 marketId, address borrower) public view returns (
 
 contract DeployTrader is Script {
     address constant MORPHO = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
+    // Replace with the actual PreLiquidation address for MARKET_ID
+    address constant PRELIQUIDATION = 0xYourExistingPreLiquidationAddress;
 
     function run() external {
         bytes32 MARKET_ID = 0x5e3e6b1e01c5708055548d82d01db741e37d03b948a7ef9f3d4b962648bcbfa7;
@@ -204,13 +260,23 @@ contract DeployTrader is Script {
         console.log("\nChecking position for:", targetBorrower);
 
         vm.startBroadcast();
-        address PRELIQUIDATION = address(0);
         MorphoTrader trader = new MorphoTrader(PRELIQUIDATION);
         console.log("\nMorphoTrader deployed at:", address(trader));
 
         try trader.checkPosition(MARKET_ID, targetBorrower) returns (bool, uint256) {
         } catch {
             console.log("Position query reverted");
+        }
+
+        console.log("\nSimulating profitability for:", targetBorrower);
+        try trader.simulateProfitability(MARKET_ID, targetBorrower) returns (
+            uint256 repayAmount,
+            uint256 seizedAmount,
+            uint256 flashLoanFee,
+            uint256 netProfit
+        ) {
+        } catch {
+            console.log("Profitability simulation reverted");
         }
 
         vm.stopBroadcast();
