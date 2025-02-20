@@ -45,6 +45,12 @@ struct PreLiquidationParams {
     address preLiquidationOracle;
 }
 
+interface IPreLiquidationFactory {
+    function createPreLiquidation(bytes32 id, PreLiquidationParams calldata preLiquidationParams)
+        external
+        returns (address preLiquidation);
+}
+
 interface IPreLiquidation {
     function preLiquidate(address borrower, uint256 seizedAssets, uint256 repaidShares, bytes calldata data) external returns (uint256, uint256);
     function preLiquidationParams() external view returns (PreLiquidationParams memory);
@@ -114,7 +120,7 @@ contract MorphoTrader {
             return (0, 0, 0, 0);
         }
 
-        // Fetch pre-liquidation parameters
+        // Fetch real pre-liquidation parameters (if PRELIQUIDATION is set)
         uint256 preLltv = 70 * 1e16; // Default: 70%
         uint256 preLIF1 = 105 * 1e16; // Default: 105%
         uint256 preLIF2 = 10825 * 1e14; // Default: 108.25%
@@ -234,8 +240,6 @@ contract MorphoTrader {
 
 contract DeployTrader is Script {
     address constant MORPHO = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
-    // Replace with the actual PreLiquidation address for MARKET_ID
-    address constant PRELIQUIDATION = 0xYourExistingPreLiquidationAddress;
 
     function run() external {
         bytes32 MARKET_ID = 0x5e3e6b1e01c5708055548d82d01db741e37d03b948a7ef9f3d4b962648bcbfa7;
@@ -260,6 +264,7 @@ contract DeployTrader is Script {
         console.log("\nChecking position for:", targetBorrower);
 
         vm.startBroadcast();
+        address PRELIQUIDATION = address(0); // Replace with actual address if deployed
         MorphoTrader trader = new MorphoTrader(PRELIQUIDATION);
         console.log("\nMorphoTrader deployed at:", address(trader));
 
